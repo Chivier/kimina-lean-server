@@ -32,6 +32,7 @@ class Manager:
         self._cond = asyncio.Condition(self._lock)
         self._free: list[Repl] = []
         self._busy: set[Repl] = set()
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
         logger.info(
             "REPL manager initialized with: MAX_REPLS={}, MAX_REPL_USES={}, MAX_REPL_MEM={} MB",
@@ -39,6 +40,13 @@ class Manager:
             max_repl_uses,
             max_repl_mem,
         )
+
+    def _create_cleanup_task(self, repl: Repl) -> asyncio.Task[None]:
+        """Create a background cleanup task and track it."""
+        task = asyncio.create_task(close_verbose(repl))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+        return task
 
     async def initialize_repls(self) -> None:
         if len(self.init_repls) == 0:
@@ -119,17 +127,20 @@ class Manager:
                     ) from None
 
         if repl_to_destroy is not None:
-            asyncio.create_task(close_verbose(repl_to_destroy))
+            self._create_cleanup_task(repl_to_destroy)
 
         return await self.start_new(header)
 
     async def destroy_repl(self, repl: Repl) -> None:
+        """Destroy a REPL immediately, awaiting its cleanup."""
         async with self._cond:
             self._busy.discard(repl)
             if repl in self._free:
                 self._free.remove(repl)
-            asyncio.create_task(close_verbose(repl))
             self._cond.notify(1)
+
+        # Await cleanup directly to ensure process is killed before returning
+        await close_verbose(repl)
 
     async def release_repl(self, repl: Repl) -> None:
         async with self._cond:
@@ -143,10 +154,11 @@ class Manager:
                 uuid = repl.uuid
                 logger.info(f"REPL {uuid.hex[:8]} is exhausted, closing it")
                 self._busy.discard(repl)
-
-                asyncio.create_task(close_verbose(repl))
                 self._cond.notify(1)
+                # Close exhausted REPL in background
+                self._create_cleanup_task(repl)
                 return
+
             self._busy.remove(repl)
             self._free.append(repl)
             repl.last_check_at = datetime.now()
@@ -163,16 +175,24 @@ class Manager:
     async def cleanup(self) -> None:
         async with self._cond:
             logger.info("Cleaning up REPL manager...")
-            for repl in self._free:
-                asyncio.create_task(close_verbose(repl))
+            all_repls = list(self._free) + list(self._busy)
             self._free.clear()
-
-            for repl in self._busy:
-                asyncio.create_task(close_verbose(repl))
             self._busy.clear()
 
-            logger.info("REPL manager cleaned up!")
-        pass
+        # Close all REPLs and await their cleanup
+        if all_repls:
+            await asyncio.gather(
+                *(close_verbose(repl) for repl in all_repls),
+                return_exceptions=True,
+            )
+
+        # Wait for any pending background cleanup tasks
+        if self._cleanup_tasks:
+            logger.info(f"Waiting for {len(self._cleanup_tasks)} background cleanup tasks...")
+            await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
+            self._cleanup_tasks.clear()
+
+        logger.info("REPL manager cleaned up!")
 
     async def prep(
         self, repl: Repl, snippet_id: str, timeout: float, debug: bool

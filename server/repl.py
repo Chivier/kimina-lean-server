@@ -22,7 +22,7 @@ from loguru import logger
 from rich.syntax import Syntax
 
 from .db import db
-from .errors import LeanError, ReplError
+from .errors import LeanError, ReplError, ReplOOMError
 from .logger import console
 from .models import ReplStatus
 from .prisma_client import prisma
@@ -75,7 +75,7 @@ class Repl:
         self.header_cmd_response: ReplResponse | None = None
 
         self.proc: Process | None = None
-        self.error_file = tempfile.TemporaryFile("w+")
+        self.error_file = tempfile.TemporaryFile("w+", encoding="utf-8", errors="ignore")
         self.max_memory_bytes = max_repl_mem * 1024 * 1024
         self.max_repl_uses = max_repl_uses
 
@@ -154,7 +154,7 @@ class Repl:
             env=os.environ,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=self.error_file,
             preexec_fn=_preexec,
         )
 
@@ -230,11 +230,14 @@ class Repl:
                 timeout,
             )
             raise e
+        except ReplOOMError as e:
+            logger.error(f"\\[{self.uuid.hex[:8]}] REPL OOM error: {e}")
+            raise e
         except LeanError as e:
-            logger.exception("Lean REPL error: %s", e)
+            logger.exception(f"Lean REPL error: {e}")
             raise e
         except ReplError as e:
-            logger.exception("REPL error: %s", e)
+            logger.exception(f"REPL error: {e}")
             raise e
 
         return ReplResponse(
@@ -266,6 +269,10 @@ class Repl:
         if self.proc.stdout is None:
             raise ReplError("stdout pipe not initialized")
 
+        # Clear error file before sending command
+        self.error_file.seek(0)
+        self.error_file.truncate()
+
         input: Command = {"cmd": snippet.code}
 
         if self.use_count != 0 and not is_header:  # remove is_header
@@ -287,27 +294,25 @@ class Repl:
             logger.error("Broken pipe while writing to REPL stdin")
             raise LeanError("Lean process broken pipe")
         except Exception as e:
-            logger.error("Failed to write to REPL stdin: %s", e)
+            logger.error(f"Failed to write to REPL stdin: {e}")
             raise LeanError("Failed to write to REPL stdin")
+
+        if self.proc.returncode is not None:
+            self.error_file.seek(0)
+            err = self.error_file.read().strip()
+            logger.error(f"REPL process exited with code {self.proc.returncode}: {err}")
+            raise ReplOOMError(err)
 
         logger.debug("Reading response from REPL stdout")
         raw = await self._read_response()
         elapsed = loop.time() - start
 
-        logger.debug("Raw response from REPL: %r", raw)
+        logger.debug(f"Raw response from REPL: {raw!r}")
         try:
             resp: CommandResponse | Error = json.loads(raw)
         except json.JSONDecodeError:
-            logger.error("JSON decode error: %r", raw)
+            logger.error(f"JSON decode error: {raw!r}")
             raise ReplError("JSON decode error")
-
-        self.error_file.seek(0)
-        err = self.error_file.read().strip()
-        self.error_file.seek(0)
-        self.error_file.truncate(0)
-        if err:
-            logger.error("Stderr: %s", err)
-            raise LeanError(err)
 
         elapsed_time = round(elapsed, 6)
         diagnostics: Diagnostics = {
@@ -341,22 +346,57 @@ class Repl:
         return b"".join(lines)
 
     async def close(self) -> None:
-        if self.proc:
-            self.last_check_at = datetime.now()
-            assert self.proc.stdin is not None, "stdin pipe not initialized"
-            self.proc.stdin.close()
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-            await self.proc.wait()
-            if self._cpu_task:
-                self._cpu_task.cancel()
-            if self._mem_task:
-                self._mem_task.cancel()
+        if not self.proc:
+            return
 
-            if db.connected:
+        self.last_check_at = datetime.now()
+
+        # Cancel monitoring tasks first
+        if self._cpu_task:
+            self._cpu_task.cancel()
+        if self._mem_task:
+            self._mem_task.cancel()
+
+        # Close stdin pipe if it exists
+        try:
+            if self.proc.stdin and not self.proc.stdin.is_closing():
+                self.proc.stdin.close()
+        except Exception as e:
+            logger.warning(f"Failed to close stdin: {e}")
+
+        # Kill process group to ensure all child processes are terminated
+        try:
+            if self.proc.returncode is None:  # Process still running
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            logger.debug(f"Process {self.proc.pid} already terminated")
+        except Exception as e:
+            logger.warning(f"Failed to kill process group: {e}")
+
+        # Wait for process to terminate
+        try:
+            await asyncio.wait_for(self.proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.error(f"Process {self.proc.pid} did not terminate after SIGKILL")
+        except Exception as e:
+            logger.warning(f"Error waiting for process: {e}")
+
+        # Close error file
+        try:
+            if self.error_file and not self.error_file.closed:
+                self.error_file.close()
+        except Exception as e:
+            logger.warning(f"Failed to close error file: {e}")
+
+        # Update database if connected
+        if db.connected:
+            try:
                 await prisma.repl.update(
                     where={"uuid": str(self.uuid)},
                     data={"status": ReplStatus.STOPPED},  # type: ignore
                 )
+            except Exception as e:
+                logger.warning(f"Failed to update REPL status in DB: {e}")
 
 
 async def close_verbose(repl: Repl) -> None:

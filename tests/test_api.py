@@ -565,3 +565,85 @@ async def test_repl_close_hangs(monkeypatch: MonkeyPatch, client: TestClient) ->
     results = resp.json()["results"]
     repl_uuids = set(result["diagnostics"]["repl_uuid"] for result in results)
     assert len(repl_uuids) == 2, "Expected two different REPLs to be used"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client",
+    [
+        {"max_repls": 2, "max_repl_uses": -1, "init_repls": {}, "database_url": None},
+    ],
+    indirect=True,
+)
+async def test_timeout_process_cleanup(client: TestClient) -> None:
+    """Test that timed-out REPL processes are properly cleaned up."""
+    import psutil
+
+    # Get initial process count
+    initial_processes = set(p.pid for p in psutil.process_iter() if "repl" in p.name().lower())
+
+    # Trigger a timeout by trying to import Mathlib with very short timeout
+    uuid = str(uuid4())
+    payload = CheckRequest(
+        snippets=[Snippet(id=uuid, code="import Mathlib")],
+        timeout=0.1,  # Very short timeout to force failure
+        debug=True,
+    ).model_dump()
+
+    resp = client.post("check", json=payload)
+    assert resp.status_code == status.HTTP_200_OK
+    result = resp.json()["results"][0]
+    assert "timed out" in result["error"]
+
+    # Wait a bit for cleanup to complete
+    await asyncio.sleep(2)
+
+    # Check that no new REPL processes are lingering
+    final_processes = set(p.pid for p in psutil.process_iter() if "repl" in p.name().lower())
+    new_processes = final_processes - initial_processes
+
+    assert len(new_processes) == 0, f"Found {len(new_processes)} lingering REPL processes after timeout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client",
+    [
+        {"max_repls": 2, "max_repl_uses": -1, "init_repls": {}, "database_url": None},
+    ],
+    indirect=True,
+)
+async def test_multiple_timeout_cleanup(client: TestClient) -> None:
+    """Test that multiple timed-out REPLs are all cleaned up properly."""
+    import psutil
+
+    # Get initial process count
+    initial_processes = set(p.pid for p in psutil.process_iter() if "repl" in p.name().lower())
+
+    # Trigger multiple timeouts concurrently
+    payloads = [
+        CheckRequest(
+            snippets=[Snippet(id=str(uuid4()), code="import Mathlib")],
+            timeout=0.1,
+            debug=True,
+        ).model_dump()
+        for _ in range(3)
+    ]
+
+    # Send all requests
+    responses = [client.post("check", json=payload) for payload in payloads]
+
+    # Verify all failed with timeout
+    for resp in responses:
+        assert resp.status_code == status.HTTP_200_OK
+        result = resp.json()["results"][0]
+        assert "timed out" in result["error"]
+
+    # Wait for all cleanups to complete
+    await asyncio.sleep(3)
+
+    # Check that no REPL processes are lingering
+    final_processes = set(p.pid for p in psutil.process_iter() if "repl" in p.name().lower())
+    new_processes = final_processes - initial_processes
+
+    assert len(new_processes) == 0, f"Found {len(new_processes)} lingering REPL processes after multiple timeouts"
