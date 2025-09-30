@@ -1,0 +1,28 @@
+services:
+  kimina-queue:
+    build: .
+    ports:
+      - "8010:8010"
+    environment:
+      - QUEUE_HOST=0.0.0.0
+      - QUEUE_PORT=8010
+      - QUEUE_LOG_LEVEL=INFO
+      - LEAN_SERVER_URL=http://kimina-lean-server:8000
+      - LEAN_SERVER_ENV_PATH=/lean-server/.env
+    volumes:
+      - ../kimina-lean-server:/lean-server
+    depends_on:
+      - kimina-lean-server
+    networks:
+      - kimina-network
+
+  kimina-lean-server:
+    image: ghcr.io/verse-lab/kimina-lean-server:latest
+    ports:
+      - "8000:8000"
+    networks:
+      - kimina-network
+
+networks:
+  kimina-network:
+    driver: bridge
